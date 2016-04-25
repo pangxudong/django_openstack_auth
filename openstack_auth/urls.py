@@ -23,13 +23,13 @@ urlpatterns = patterns(
     'openstack_auth.views',
     url(r"^login/$", "login", name='login'),
     url(r"^logout/$", 'logout', name='logout'),
+    url(r"^register/$", 'register', name='register'),# added by PXD
+    url(r"^register/validate/(?P<token>[^/]+)/$", 'register_validate', name='register_validate'),# added by PXD
+    url(r"^reset/$", 'reset', name='reset'),# added by PXD
+    url(r"^reset/validate/(?P<token>[^/]+)/$", 'reset_validate', name='reset_validate'),# added by PXD
+    url(r"^reset/done/$", 'reset_done', name='reset_done'),# added by PXD
+    url(r"^reset/(?P<user_id>[^/]+)/$", 'reset_password', name='reset_password'),# added by PXD
     url(r'^switch/(?P<tenant_id>[^/]+)/$', 'switch', name='switch_tenants'),
     url(r'^switch_services_region/(?P<region_name>[^/]+)/$', 'switch_region',
         name='switch_services_region')
 )
-
-if utils.is_websso_enabled():
-    urlpatterns += patterns(
-        'openstack_auth.views',
-        url(r"^websso/$", "websso", name='websso')
-    )

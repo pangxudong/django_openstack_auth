@@ -12,14 +12,14 @@
 # limitations under the License.
 
 import datetime
+import functools
 import logging
-import sys
 
-import django
 from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth import middleware
 from django.contrib.auth import models
+from django.utils import decorators
 from django.utils import timezone
 from keystoneclient.auth.identity import v2 as v2_auth
 from keystoneclient.auth.identity import v3 as v3_auth
@@ -27,11 +27,12 @@ from keystoneclient.auth import token_endpoint
 from keystoneclient import session
 from keystoneclient.v2_0 import client as client_v2
 from keystoneclient.v3 import client as client_v3
-import six
 from six.moves.urllib import parse as urlparse
 
 
 LOG = logging.getLogger(__name__)
+
+_PROJECT_CACHE = {}
 
 _TOKEN_TIMEOUT_MARGIN = getattr(settings, 'TOKEN_TIMEOUT_MARGIN', 0)
 
@@ -76,12 +77,9 @@ def is_token_valid(token, margin=None):
 
     Returns ``True`` if the token has not yet expired, otherwise ``False``.
 
-    .. param:: token
+    :param token: The openstack_auth.user.Token instance to check
 
-       The openstack_auth.user.Token instance to check
-
-    .. param:: margin
-
+    :param margin:
        A time margin in seconds to subtract from the real token's validity.
        An example usage is that the token can be valid once the middleware
        passed, and invalid (timed-out) during a view rendering and this
@@ -118,11 +116,35 @@ def is_safe_url(url, host=None):
     return not netloc or netloc == host
 
 
-# DEPRECATED -- Mitaka
-# This method definition is included to prevent breaking backward compatibility
-# The original functionality was problematic and has been removed.
+def memoize_by_keyword_arg(cache, kw_keys):
+    """Memoize a function using the list of keyword argument name as its key.
+
+    Wrap a function so that results for any keyword argument tuple are stored
+    in 'cache'. Note that the keyword args to the function must be usable as
+    dictionary keys.
+
+    :param cache: Dictionary object to store the results.
+    :param kw_keys: List of keyword arguments names. The values are used
+                    for generating the key in the cache.
+    """
+    def _decorator(func):
+        @functools.wraps(func, assigned=decorators.available_attrs(func))
+        def wrapper(*args, **kwargs):
+            mem_args = [kwargs[key] for key in kw_keys if key in kwargs]
+            mem_args = '__'.join(str(mem_arg) for mem_arg in mem_args)
+            if not mem_args:
+                return func(*args, **kwargs)
+            if mem_args in cache:
+                return cache[mem_args]
+            result = func(*args, **kwargs)
+            cache[mem_args] = result
+            return result
+        return wrapper
+    return _decorator
+
+
 def remove_project_cache(token):
-    pass
+    _PROJECT_CACHE.pop(token, None)
 
 
 # Helper for figuring out keystone version
@@ -162,6 +184,80 @@ def build_absolute_uri(request, relative_url):
         webroot = webroot[:-1]
 
     return request.build_absolute_uri(webroot + relative_url)
+
+
+def get_websso_url(request, auth_url, websso_auth):
+    """Return the keystone endpoint for initiating WebSSO.
+
+    Generate the keystone WebSSO endpoint that will redirect the user
+    to the login page of the federated identity provider.
+
+    Based on the authentication type selected by the user in the login
+    form, it will construct the keystone WebSSO endpoint.
+
+    :param request: Django http request object.
+    :type request: django.http.HttpRequest
+    :param auth_url: Keystone endpoint configured in the horizon setting.
+                     The value is derived from:
+                     - OPENSTACK_KEYSTONE_URL
+                     - AVAILABLE_REGIONS
+    :type auth_url: string
+    :param websso_auth: Authentication type selected by the user from the
+                        login form. The value is derived from the horizon
+                        setting WEBSSO_CHOICES.
+    :type websso_auth: string
+
+    Example of horizon WebSSO setting::
+        WEBSSO_CHOICES = (
+            ("credentials", "Keystone Credentials"),
+            ("oidc", "OpenID Connect"),
+            ("saml2", "Security Assertion Markup Language"),
+            ("acme_oidc", "ACME - OpenID Connect"),
+            ("acme_saml2", "ACME - SAML2")
+        )
+
+        WEBSSO_IDP_MAPPING = {
+            "acme_oidc": ("acme", "oidc"),
+            "acme_saml2": ("acme", "saml2")
+            }
+        }
+
+    The value of websso_auth will be looked up in the WEBSSO_IDP_MAPPING
+    dictionary, if a match is found it will return a IdP specific WebSSO
+    endpoint using the values found in the mapping.
+
+    The value in WEBSSO_IDP_MAPPING is expected to be a tuple formatted as
+    (<idp_id>, <protocol_id>). Using the values found, a IdP/protocol
+    specific URL will be constructed:
+        /auth/OS-FEDERATION/identity_providers/<idp_id>
+        /protocols/<protocol_id>/websso
+
+    If no value is found from the WEBSSO_IDP_MAPPING dictionary, it will
+    treat the value as the global WebSSO protocol <protocol_id> and
+    construct the WebSSO URL by:
+        /auth/OS-FEDERATION/websso/<protocol_id>
+
+    :returns: Keystone WebSSO endpoint.
+    :rtype: string
+
+    """
+    origin = build_absolute_uri(request, '/auth/websso/')
+    idp_mapping = getattr(settings, 'WEBSSO_IDP_MAPPING', {})
+    idp_id, protocol_id = idp_mapping.get(websso_auth,
+                                          (None, websso_auth))
+
+    if idp_id:
+        # Use the IDP specific WebSSO endpoint
+        url = ('%s/auth/OS-FEDERATION/identity_providers/%s'
+               '/protocols/%s/websso?origin=%s' %
+               (auth_url, idp_id, protocol_id, origin))
+    else:
+        # If no IDP mapping found for the identifier,
+        # perform WebSSO by protocol.
+        url = ('%s/auth/OS-FEDERATION/websso/%s?origin=%s' %
+               (auth_url, protocol_id, origin))
+
+    return url
 
 
 def has_in_url_path(url, sub):
@@ -216,6 +312,7 @@ def get_token_auth_plugin(auth_url, token, project_id=None):
                              reauthenticate=False)
 
 
+@memoize_by_keyword_arg(_PROJECT_CACHE, ('token', ))
 def get_project_list(*args, **kwargs):
     is_federated = kwargs.get('is_federated', False)
     sess = kwargs.get('session') or get_session()
@@ -291,65 +388,3 @@ def get_endpoint_region(endpoint):
     Keystone V2 and V3.
     """
     return endpoint.get('region_id') or endpoint.get('region')
-
-
-if django.VERSION < (1, 7):
-    try:
-        from importlib import import_module
-    except ImportError:
-        # NOTE(jamielennox): importlib was introduced in python 2.7. This is
-        # copied from the backported importlib library. See:
-        # http://svn.python.org/projects/python/trunk/Lib/importlib/__init__.py
-
-        def _resolve_name(name, package, level):
-            """Return the absolute name of the module to be imported."""
-            if not hasattr(package, 'rindex'):
-                raise ValueError("'package' not set to a string")
-            dot = len(package)
-            for x in xrange(level, 1, -1):
-                try:
-                    dot = package.rindex('.', 0, dot)
-                except ValueError:
-                    raise ValueError("attempted relative import beyond "
-                                     "top-level package")
-            return "%s.%s" % (package[:dot], name)
-
-        def import_module(name, package=None):
-            """Import a module.
-
-            The 'package' argument is required when performing a relative
-            import. It specifies the package to use as the anchor point from
-            which to resolve the relative import to an absolute import.
-            """
-            if name.startswith('.'):
-                if not package:
-                    raise TypeError("relative imports require the "
-                                    "'package' argument")
-                level = 0
-                for character in name:
-                    if character != '.':
-                        break
-                    level += 1
-                name = _resolve_name(name[level:], package, level)
-            __import__(name)
-            return sys.modules[name]
-
-    # NOTE(jamielennox): copied verbatim from django 1.7
-    def import_string(dotted_path):
-        try:
-            module_path, class_name = dotted_path.rsplit('.', 1)
-        except ValueError:
-            msg = "%s doesn't look like a module path" % dotted_path
-            six.reraise(ImportError, ImportError(msg), sys.exc_info()[2])
-
-        module = import_module(module_path)
-
-        try:
-            return getattr(module, class_name)
-        except AttributeError:
-            msg = 'Module "%s" does not define a "%s" attribute/class' % (
-                dotted_path, class_name)
-            six.reraise(ImportError, ImportError(msg), sys.exc_info()[2])
-
-else:
-    from django.utils.module_loading import import_string  # noqa

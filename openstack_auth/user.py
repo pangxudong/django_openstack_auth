@@ -16,13 +16,16 @@ import logging
 
 from django.conf import settings
 from django.contrib.auth import models
+from django.db import models as db_models
 from keystoneclient.common import cms as keystone_cms
 from keystoneclient import exceptions as keystone_exceptions
+import six
 
 from openstack_auth import utils
 
 
 LOG = logging.getLogger(__name__)
+_TOKEN_HASH_ENABLED = getattr(settings, 'OPENSTACK_TOKEN_HASH_ENABLED', True)
 
 
 def set_session_from_user(request, user):
@@ -81,8 +84,9 @@ class Token(object):
         # Token-related attributes
         self.id = auth_ref.auth_token
         self.unscoped_token = unscoped_token
-        if (keystone_cms.is_asn1_token(self.id)
-                or keystone_cms.is_pkiz(self.id)):
+        if (_TOKEN_HASH_ENABLED and
+                (keystone_cms.is_asn1_token(self.id)
+                    or keystone_cms.is_pkiz(self.id))):
             algorithm = getattr(settings, 'OPENSTACK_TOKEN_HASH_ALGORITHM',
                                 'md5')
             hasher = hashlib.new(algorithm)
@@ -118,7 +122,7 @@ class Token(object):
         self.serviceCatalog = auth_ref.service_catalog.get_data()
 
 
-class User(models.AnonymousUser):
+class User(models.AbstractBaseUser, models.AnonymousUser):
     """A User class with some extra special sauce for Keystone.
 
     In addition to the standard Django user attributes, this class also has
@@ -186,16 +190,21 @@ class User(models.AnonymousUser):
         Unscoped Keystone token.
 
     """
+
+    keystone_user_id = db_models.CharField(primary_key=True, max_length=255)
+    USERNAME_FIELD = 'keystone_user_id'
+
     def __init__(self, id=None, token=None, user=None, tenant_id=None,
                  service_catalog=None, tenant_name=None, roles=None,
                  authorized_tenants=None, endpoint=None, enabled=False,
                  services_region=None, user_domain_id=None,
                  user_domain_name=None, domain_id=None, domain_name=None,
                  project_id=None, project_name=None,
-                 is_federated=False, unscoped_token=None):
+                 is_federated=False, unscoped_token=None, password=None):
         self.id = id
         self.pk = id
         self.token = token
+        self.keystone_user_id = id
         self.username = user
         self.user_domain_id = user_domain_id
         self.user_domain_name = user_domain_name
@@ -222,6 +231,9 @@ class User(models.AnonymousUser):
         self.tenant_id = self.project_id
         self.tenant_name = self.project_name
 
+        # Required by AbstractBaseUser
+        self.password = None
+
     def __unicode__(self):
         return self.username
 
@@ -234,8 +246,7 @@ class User(models.AnonymousUser):
         Returns ``True`` if the token is expired, ``False`` if not, and
         ``None`` if there is no token set.
 
-        .. param:: margin
-
+        :param margin:
            A security time margin in seconds before real expiration.
            Will return ``True`` if the token expires in less than ``margin``
            seconds of time.
@@ -250,8 +261,7 @@ class User(models.AnonymousUser):
     def is_authenticated(self, margin=None):
         """Checks for a valid authentication.
 
-        .. param:: margin
-
+        :param margin:
            A security time margin in seconds before end of authentication.
            Will return ``False`` if authentication ends in less than ``margin``
            seconds of time.
@@ -267,8 +277,7 @@ class User(models.AnonymousUser):
 
         Returns ``True`` if not authenticated,``False`` otherwise.
 
-        .. param:: margin
-
+        :param margin:
            A security time margin in seconds before end of an eventual
            authentication.
            Will return ``True`` even if authenticated but that authentication
@@ -387,7 +396,7 @@ class User(models.AnonymousUser):
         if not perm_list:
             return True
         for perm in perm_list:
-            if isinstance(perm, basestring):
+            if isinstance(perm, six.string_types):
                 # check that the permission matches
                 if not self.has_perm(perm, obj):
                     return False

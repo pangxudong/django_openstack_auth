@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import uuid
+
 from django.conf import settings
 from django.contrib import auth
 from django.core.urlresolvers import reverse
@@ -434,6 +436,35 @@ class OpenStackAuthTestsV2(OpenStackAuthTestsMixin, test.TestCase):
             token=unscoped.auth_token)
         self.assertEqual(tenant_list, expected_tenants)
 
+    def test_tenant_list_caching(self):
+        tenants = [self.data.tenant_two, self.data.tenant_one]
+        expected_tenants = [self.data.tenant_one, self.data.tenant_two]
+        user = self.data.user
+        unscoped = self.data.unscoped_access_info
+
+        client = self._mock_unscoped_client_with_token(user, unscoped)
+        self._mock_unscoped_list_tenants(client, tenants)
+        self.mox.ReplayAll()
+
+        tenant_list = utils.get_project_list(
+            user_id=user.id,
+            auth_url=settings.OPENSTACK_KEYSTONE_URL,
+            token=unscoped.auth_token)
+        self.assertEqual(tenant_list, expected_tenants)
+
+        # Test to validate that requesting the project list again results
+        # to using the cache and will not make a Keystone call.
+        self.assertEqual(utils._PROJECT_CACHE.get(unscoped.auth_token),
+                         expected_tenants)
+        tenant_list = utils.get_project_list(
+            user_id=user.id,
+            auth_url=settings.OPENSTACK_KEYSTONE_URL,
+            token=unscoped.auth_token)
+        self.assertEqual(tenant_list, expected_tenants)
+
+        utils.remove_project_cache(unscoped.auth_token)
+        self.assertIsNone(utils._PROJECT_CACHE.get(unscoped.auth_token))
+
 
 class OpenStackAuthTestsV3(OpenStackAuthTestsMixin, test.TestCase):
 
@@ -760,6 +791,36 @@ class OpenStackAuthTestsV3(OpenStackAuthTestsMixin, test.TestCase):
             token=unscoped.auth_token)
         self.assertEqual(project_list, expected_projects)
 
+    def test_tenant_list_caching(self):
+        projects = [self.data.project_two, self.data.project_one]
+        expected_projects = [self.data.project_one, self.data.project_two]
+        user = self.data.user
+        unscoped = self.data.unscoped_access_info
+
+        client = self._mock_unscoped_client_with_token(user, unscoped)
+        self._mock_unscoped_list_projects(client, user, projects)
+
+        self.mox.ReplayAll()
+
+        project_list = utils.get_project_list(
+            user_id=user.id,
+            auth_url=settings.OPENSTACK_KEYSTONE_URL,
+            token=unscoped.auth_token)
+        self.assertEqual(project_list, expected_projects)
+
+        # Test to validate that requesting the project list again results
+        # to using the cache and will not make a Keystone call.
+        self.assertEqual(utils._PROJECT_CACHE.get(unscoped.auth_token),
+                         expected_projects)
+        project_list = utils.get_project_list(
+            user_id=user.id,
+            auth_url=settings.OPENSTACK_KEYSTONE_URL,
+            token=unscoped.auth_token)
+        self.assertEqual(project_list, expected_projects)
+
+        utils.remove_project_cache(unscoped.auth_token)
+        self.assertIsNone(utils._PROJECT_CACHE.get(unscoped.auth_token))
+
 
 class OpenStackAuthTestsWebSSO(OpenStackAuthTestsMixin, test.TestCase):
 
@@ -804,14 +865,24 @@ class OpenStackAuthTestsWebSSO(OpenStackAuthTestsMixin, test.TestCase):
         self.data = data_v3.generate_test_data()
         self.ks_client_module = client_v3
 
+        self.idp_id = uuid.uuid4().hex
+        self.idp_oidc_id = uuid.uuid4().hex
+        self.idp_saml2_id = uuid.uuid4().hex
+
         settings.OPENSTACK_API_VERSIONS['identity'] = 3
         settings.OPENSTACK_KEYSTONE_URL = 'http://localhost:5000/v3'
         settings.WEBSSO_ENABLED = True
         settings.WEBSSO_CHOICES = (
             ('credentials', 'Keystone Credentials'),
             ('oidc', 'OpenID Connect'),
-            ('saml2', 'Security Assertion Markup Language')
+            ('saml2', 'Security Assertion Markup Language'),
+            (self.idp_oidc_id, 'IDP OIDC'),
+            (self.idp_saml2_id, 'IDP SAML2')
         )
+        settings.WEBSSO_IDP_MAPPING = {
+            self.idp_oidc_id: (self.idp_id, 'oidc'),
+            self.idp_saml2_id: (self.idp_id, 'saml2')
+        }
 
         self.mox.StubOutClassWithMocks(token_endpoint, 'Token')
         self.mox.StubOutClassWithMocks(auth_v3, 'Token')
@@ -826,14 +897,33 @@ class OpenStackAuthTestsWebSSO(OpenStackAuthTestsMixin, test.TestCase):
         self.assertContains(response, 'credentials')
         self.assertContains(response, 'oidc')
         self.assertContains(response, 'saml2')
+        self.assertContains(response, self.idp_oidc_id)
+        self.assertContains(response, self.idp_saml2_id)
 
-    def test_websso_redirect(self):
+    def test_websso_redirect_by_protocol(self):
         origin = 'http://testserver/auth/websso/'
         protocol = 'oidc'
         redirect_url = ('%s/auth/OS-FEDERATION/websso/%s?origin=%s' %
                         (settings.OPENSTACK_KEYSTONE_URL, protocol, origin))
 
         form_data = {'auth_type': protocol,
+                     'region': settings.OPENSTACK_KEYSTONE_URL}
+        url = reverse('login')
+
+        # POST to the page and redirect to keystone.
+        response = self.client.post(url, form_data)
+        self.assertRedirects(response, redirect_url, status_code=302,
+                             target_status_code=404)
+
+    def test_websso_redirect_by_idp(self):
+        origin = 'http://testserver/auth/websso/'
+        protocol = 'oidc'
+        redirect_url = ('%s/auth/OS-FEDERATION/identity_providers/%s'
+                        '/protocols/%s/websso?origin=%s' %
+                        (settings.OPENSTACK_KEYSTONE_URL, self.idp_id,
+                         protocol, origin))
+
+        form_data = {'auth_type': self.idp_oidc_id,
                      'region': settings.OPENSTACK_KEYSTONE_URL}
         url = reverse('login')
 
@@ -875,6 +965,27 @@ class PolicyLoaderTestCase(test.TestCase):
         self.assertEqual(2, len(policy._ENFORCER))
         policy.reset()
         self.assertIsNone(policy._ENFORCER)
+
+
+class PermTestCase(test.TestCase):
+    def test_has_perms(self):
+        testuser = user.User(id=1, roles=[])
+
+        def has_perm(perm, obj=None):
+            return perm in ('perm1', 'perm3')
+
+        with mock.patch.object(testuser, 'has_perm', side_effect=has_perm):
+            self.assertFalse(testuser.has_perms(['perm2']))
+
+            # perm1 AND perm3
+            self.assertFalse(testuser.has_perms(['perm1', 'perm2']))
+
+            # perm1 AND perm3
+            self.assertTrue(testuser.has_perms(['perm1', 'perm3']))
+
+            # perm1 AND (perm2 OR perm3)
+            perm_list = ['perm1', ('perm2', 'perm3')]
+            self.assertTrue(testuser.has_perms(perm_list))
 
 
 class PolicyTestCase(test.TestCase):
